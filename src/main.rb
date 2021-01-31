@@ -38,7 +38,8 @@ class ExtractionWatcher
         @output_dir = output_dir
         @zip_filename = zip_filename
 
-        @stables_files = StableFiles.new(output_dir, zip_filename)
+        @stable_files = StableFiles.new(output_dir, zip_filename)
+        @large_files = LargeFiles.new(output_dir, MODIFIED_FILE_MINIMUM_SIZE_IN_MB)
 
         @dw = DirectoryWatcher.new input_dir
         @dw.interval = INTERVAL_SECS
@@ -48,21 +49,96 @@ class ExtractionWatcher
     end
 
     def destroy
-        @stables_files.close_zip
         @dw.stop
+    end
+    
+    def flush
+        @stable_files.close_zip
+        @large_files.flush_leftover_to_zip
     end
 
     def event_trigger(directory, event)
         if event.type == :stable
-            @stables_files.add(event.path)
+            @stable_files.add(event.path)
         elsif event.type == :modified && event.stat.size > MODIFIED_FILE_MINIMUM_SIZE_IN_MB
-            LargeFiles.handle_modify(@output_dir, event.path, MODIFIED_FILE_MINIMUM_SIZE_IN_MB)
+            @large_files.handle_modify(event.path)
         end
     end
 
     private
 
     def zip_send_threaded
+    end
+end
+
+class StableFiles
+
+    ZIPFILE_PARTS_EXT = '_part'
+    ZIPFILE_MAX_SIZE_IN_MB = 1*1024*1014
+
+    def initialize(output_dir, zip_filename)
+        @output_dir = output_dir
+        @zip_filename = zip_filename
+        @zip_fullfilename = File.join(@output_dir, @zip_filename)
+        zip_init
+    end
+    
+    def close_zip
+        @zip.close
+    end
+    
+    def add event_path
+        filename = File.basename(event_path)
+        $logger.debug("stable file detected #{filename}, ready to zip it to #{@zip_fullfilename}")
+        @zip.add(filename, event_path) unless @zip.find_entry filename # don't allow duplicates
+        @zip.commit
+        zip_size = File.size(@zip_fullfilename)
+        if zip_size > ZIPFILE_MAX_SIZE_IN_MB
+            $logger.debug("#{@zip_fullfilename} is getting too large (#{zip_size/1_000_000}MB>#{ZIPFILE_MAX_SIZE_IN_MB}MB)")
+            @zip.close
+            zip_send_threaded
+            @stable_files.zip_init
+        end
+    end
+
+    private 
+
+    def zip_init
+        @zip_part = @zip_part == nil ? 1 : @zip_part+1
+        ext = (@zip_part == 1) ? '' : ZIPFILE_PARTS_EXT + @zip_part.to_s
+        @zip_filename_current = File.join(@output_dir, File.basename(@zip_filename, '.zip') + ext + '.zip')
+        @zip = ::Zip::File.open(@zip_filename_current, !File.exist?(@zip_filename_current))
+    end
+end
+
+class LargeFiles
+
+    def initialize(output_dir, batch_size)
+        @output_dir = output_dir
+        @batch_size = batch_size
+        @large_files = []
+    end
+
+    def handle_modify(full_filename)
+        # $logger.debug("large files - large file being watched : #{full_filename}")
+        retrieve_large_file(@output_dir, full_filename).zip_new_batch_of_bytes @batch_size
+    end
+
+    def flush_leftover_to_zip
+        $logger.debug('flushing leftover for all large files ...') if @large_files.count > 0
+        @large_files.each { |large_file| large_file.flush_leftover_to_zip }
+    end
+
+    private
+
+    def retrieve_large_file(output_dir, full_filename)
+        @large_files.each do |large_file|
+            return large_file if large_file.full_filename == full_filename
+        end
+        $logger.debug("large files - new large file object created")
+        large_file = LargeFile.new(output_dir, full_filename)
+        @large_files << large_file
+        large_file
     end
 end
 
@@ -80,8 +156,8 @@ class LargeFile
         $logger.debug("large file - creates a new zip file #{zip_full_filename}")
     end
 
-    def flush
-        $logger.debug("flushing file #{@full_filename}")
+    def flush_leftover_to_zip
+        $logger.debug("flushing leftover to zip for #{@full_filename}")
         zip_new_batch_of_bytes(1)
         @zip.close
     end
@@ -112,81 +188,12 @@ class LargeFile
     end
 end
 
-class StableFiles
-
-    ZIPFILE_PARTS_EXT = '_part'
-    ZIPFILE_MAX_SIZE_IN_MB = 1*1024*1014
-
-    def initialize(output_dir, zip_filename)
-        @output_dir = output_dir
-        @zip_filename = zip_filename
-        @zip_fullfilename = File.join(@output_dir, @zip_filename)
-        zip_init
-    end
-    
-    def close_zip
-        @zip.close
-    end
-    
-    def add event_path
-        filename = File.basename(event_path)
-        $logger.debug("stable file detected #{filename}, ready to zip it to #{@zip_fullfilename}")
-        @zip.add(filename, event_path) unless @zip.find_entry filename # don't allow duplicates
-        @zip.commit
-        zip_size = File.size(@zip_fullfilename)
-        if zip_size > ZIPFILE_MAX_SIZE_IN_MB
-            $logger.debug("#{@zip_fullfilename} is getting too large (#{zip_size/1_000_000}MB>#{ZIPFILE_MAX_SIZE_IN_MB}MB)")
-            @zip.close
-            zip_send_threaded
-            @stables_files.zip_init
-        end
-    end
-
-    private 
-
-    def zip_init
-        @zip_part = @zip_part == nil ? 1 : @zip_part+1
-        ext = (@zip_part == 1) ? '' : ZIPFILE_PARTS_EXT + @zip_part.to_s
-        @zip_filename_current = File.join(@output_dir, File.basename(@zip_filename, '.zip') + ext + '.zip')
-        @zip = ::Zip::File.open(@zip_filename_current, !File.exist?(@zip_filename_current))
-    end
-end
-
-class LargeFiles
-    @@large_files = []
-
-    def self.handle_modify(output_dir, full_filename, batch_size)
-        # $logger.debug("large files - large file being watched : #{full_filename}")
-        self.retrieve_large_file(output_dir, full_filename).zip_new_batch_of_bytes batch_size
-    end
-
-    def self.flush
-        $logger.debug('flushing large files ...')
-        @@large_files.each { |large_file| large_file.flush }
-    end
-
-    private
-
-    def self.retrieve_large_file(output_dir, full_filename)
-        @@large_files.each do |large_file|
-            return large_file if large_file.full_filename == full_filename
-        end
-        $logger.debug("large files - new large file object created")
-        large_file = LargeFile.new(output_dir, full_filename)
-        @@large_files << large_file
-        large_file
-    end
-end
-
-
 thr = Thread.new { 
     puts 'Working on dossiers.csv ...'
     generate_dossiers_csv(File.join('bin/input', 'dossiers.csv')) 
     puts 'Done.'
 }
 
-ExtractionWatcher.new('bin/input', 'bin/output', 'small.zip') 
-
+ew = ExtractionWatcher.new('bin/input', 'bin/output', 'small.zip') 
 thr.join
-
-LargeFiles.flush
+ew.flush
