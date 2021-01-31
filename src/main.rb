@@ -32,16 +32,13 @@ end
 class ExtractionWatcher
 
     INTERVAL_SECS = 2.0
-
     MODIFIED_FILE_MINIMUM_SIZE_IN_MB = 2*1024*1024
-
-    ZIPFILE_MAX_SIZE_IN_MB = 1*1024*1014
-    ZIPFILE_PARTS_EXT = '_part'
 
     def initialize(input_dir, output_dir, zip_filename)
         @output_dir = output_dir
         @zip_filename = zip_filename
-        zip_init
+
+        @stables_files = StableFiles.new(output_dir, zip_filename)
 
         @dw = DirectoryWatcher.new input_dir
         @dw.interval = INTERVAL_SECS
@@ -51,41 +48,19 @@ class ExtractionWatcher
     end
 
     def destroy
-        @zip.close
+        @stables_files.close_zip
         @dw.stop
     end
 
     def event_trigger(directory, event)
-        filename = File.basename(event.path)
-
-        # add file to zip when 'stable' event is triggered 
         if event.type == :stable
-            zip_fullfilename = File.join(@output_dir, @zip_filename)
-            $logger.debug("stable file detected #{filename}, ready to zip it to #{zip_fullfilename}")
-            @zip.add(filename, event.path) unless @zip.find_entry filename # don't allow duplicates
-            @zip.commit
-            zip_size = File.size(zip_fullfilename)
-            if zip_size > ZIPFILE_MAX_SIZE_IN_MB
-                $logger.debug("#{zip_fullfilename} is getting too large (#{zip_size/1_000_000}MB>#{ZIPFILE_MAX_SIZE_IN_MB}MB)")
-                @zip.close
-                zip_send_threaded
-                zip_init
-            end
-
+            @stables_files.add(event.path)
         elsif event.type == :modified && event.stat.size > MODIFIED_FILE_MINIMUM_SIZE_IN_MB
-            $logger.debug("modified file detected #{filename}, will try to zip it")
             LargeFiles.handle_modify(@output_dir, event.path, MODIFIED_FILE_MINIMUM_SIZE_IN_MB)
         end
     end
 
     private
-
-    def zip_init
-        @zip_part = @zip_part == nil ? 1 : @zip_part+1
-        ext = (@zip_part == 1) ? '' : ZIPFILE_PARTS_EXT + @zip_part.to_s
-        @zip_filename_current = File.join(@output_dir, File.basename(@zip_filename, '.zip') + ext + '.zip')
-        @zip = ::Zip::File.open(@zip_filename_current, !File.exist?(@zip_filename_current))
-    end
 
     def zip_send_threaded
     end
@@ -134,6 +109,46 @@ class LargeFile
 
     def archive_filename
         File.basename(@full_filename, '.*') + (@part == 0 ? '' : "_part#{@part+1}") + File.extname(@full_filename)
+    end
+end
+
+class StableFiles
+
+    ZIPFILE_PARTS_EXT = '_part'
+    ZIPFILE_MAX_SIZE_IN_MB = 1*1024*1014
+
+    def initialize(output_dir, zip_filename)
+        @output_dir = output_dir
+        @zip_filename = zip_filename
+        @zip_fullfilename = File.join(@output_dir, @zip_filename)
+        zip_init
+    end
+    
+    def close_zip
+        @zip.close
+    end
+    
+    def add event_path
+        filename = File.basename(event_path)
+        $logger.debug("stable file detected #{filename}, ready to zip it to #{@zip_fullfilename}")
+        @zip.add(filename, event_path) unless @zip.find_entry filename # don't allow duplicates
+        @zip.commit
+        zip_size = File.size(@zip_fullfilename)
+        if zip_size > ZIPFILE_MAX_SIZE_IN_MB
+            $logger.debug("#{@zip_fullfilename} is getting too large (#{zip_size/1_000_000}MB>#{ZIPFILE_MAX_SIZE_IN_MB}MB)")
+            @zip.close
+            zip_send_threaded
+            @stables_files.zip_init
+        end
+    end
+
+    private 
+
+    def zip_init
+        @zip_part = @zip_part == nil ? 1 : @zip_part+1
+        ext = (@zip_part == 1) ? '' : ZIPFILE_PARTS_EXT + @zip_part.to_s
+        @zip_filename_current = File.join(@output_dir, File.basename(@zip_filename, '.zip') + ext + '.zip')
+        @zip = ::Zip::File.open(@zip_filename_current, !File.exist?(@zip_filename_current))
     end
 end
 
