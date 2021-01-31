@@ -24,7 +24,7 @@ def generate_dossiers_csv(filename)
                 Faker::GreekPhilosophers.quote
             ]
             sleep(1.0/10000)
-            $logger.debug("generating csv ... #{index} lines") if index % 10_000 == 0
+            $logger.debug("#{index} entries added to #{filename}") if index % 10_000 == 0
         end
     end
 end
@@ -189,11 +189,13 @@ class LargeFile
 end
 
 thr = Thread.new { 
-    puts 'Working on dossiers.csv ...'
+    puts 'Simulating dossiers.csv generation ...'
     generate_dossiers_csv(File.join('bin/input', 'dossiers.csv')) 
-    puts 'Done.'
+    puts 'Finished with dossiers.csv'
 }
 
-ew = ExtractionWatcher.new('bin/input', 'bin/output', 'small.zip') 
+#ew = ExtractionWatcher.new('bin/input', 'bin/output', 'small.zip') 
 thr.join
-ew.flush
+#ew.flush
+
+$logger.debug('Done.')
